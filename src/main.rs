@@ -402,7 +402,7 @@ impl<'a> Debugger<'a> {
                             typ:       BreakpointType::Single,
                             orig_byte: None,
                             funcname:  funcname.clone(),
-                            funcoff:   funcoff as usize,
+                            funcoff:   blockoff as usize,
                             modname:   module.clone(),
                         }
                     );
