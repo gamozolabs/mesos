@@ -52,11 +52,12 @@ use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
 use std::iter::once;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::io::BufWriter;
 
-/// Seperator used in mesos files
+/// Separator used in mesos files
 /// This is just a "random" string to allow us to not have to worry about
 /// escaping strings that contain our separator. We just split on this
-const SEPERATOR: &str = "~~ed6ed28d321bbdc8~~";
+const SEPARATOR: &str = "\0";
 
 /// Tracks if an exit has been requested via the Ctrl+C/Ctrl+Break handler
 static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -131,7 +132,7 @@ enum BreakpointType {
 /// Structure to represent breakpoints
 #[derive(Clone, Debug)]
 pub struct Breakpoint {
-    /// Offset
+    /// Offset from module base
     offset: usize,
 
     /// Tracks if this breakpoint is currently active
@@ -144,14 +145,17 @@ pub struct Breakpoint {
     /// Tracks if this breakpoint should stick around after it's hit once
     typ: BreakpointType,
 
-    /// Name of the breakpoint
-    name: Arc<String>,
+    /// Name of the function this breakpoint is in
+    funcname: Arc<String>,
+
+    /// Offset into the function that this breakpoint addresses
+    funcoff:  usize,
 
     /// Module name
     modname: Arc<String>,
 }
 
-pub struct Debugger {
+pub struct Debugger<'a> {
     /// List of breakpoints we want to apply, keyed by module
     /// This is not the _active_ list of breakpoints, it only refers to things
     /// we would like to apply if we see this module show up
@@ -174,7 +178,7 @@ pub struct Debugger {
     /// List of all PCs we hit during execution
     /// Keyed by PC
     /// Tuple is (module, offset, symbol+offset, frequency)
-    coverage: HashMap<usize, (Arc<String>, usize, Arc<String>, u64)>,
+    coverage: HashMap<usize, (Arc<String>, usize, String, u64)>,
 
     /// Set of DLL names and the corresponding DLL base
     modules: HashSet<(String, usize)>,
@@ -194,6 +198,22 @@ pub struct Debugger {
 
     /// Process ID of the process we're debugging
     pid: u32,
+
+    /// Time we attached to the target at
+    start_time: Instant,
+
+    /// Prints breakpoints as we hit them if set
+    bp_print: bool,
+
+    /// Pointer to aligned context structure
+    context: &'a mut CONTEXT,
+    _context_backing: Vec<u8>,
+}
+
+/// Get elapsed time in seconds
+fn elapsed_from(start: &Instant) -> f64 {
+    let dur = start.elapsed();
+    dur.as_secs() as f64 + dur.subsec_nanos() as f64 / 1_000_000_000.0
 }
 
 fn u32_from_slice(val: &[u8]) -> u32 {
@@ -204,9 +224,19 @@ fn u32_from_slice(val: &[u8]) -> u32 {
     ((val[3] as u32) << 24)
 }
 
-impl Debugger {
+// Mesos print with uptime prefix
+macro_rules! mprint {
+    ($x:ident, $($arg:tt)*) => {
+        print!("[{:14.6}] ", elapsed_from(&$x.start_time));
+        print!($($arg)*);
+    }
+}
+
+impl<'a> Debugger<'a> {
     /// Create a new debugger and attach to `pid`
-    pub fn attach(pid: u32) -> Debugger {
+    pub fn attach(pid: u32) -> Debugger<'a> {
+        let start_time = Instant::now();
+
         unsafe {
             let handle = 
                 OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
@@ -233,6 +263,21 @@ impl Debugger {
                  and do you have correct permissions?");
         }
 
+        // Correctly initialize a context so it's aligned. We overcommit
+        // with `buf` to give room for the CONTEXT to slide for alignment
+        let mut cptr: *mut CONTEXT = std::ptr::null_mut();
+        let mut context_backing =
+            vec![0u8; std::mem::size_of::<CONTEXT>() + 4096];
+        let mut clen: u32 = context_backing.len() as u32;
+
+        unsafe {
+            assert!(InitializeContext(
+                context_backing.as_mut_ptr() as *mut _,
+                CONTEXT_ALL, 
+                &mut cptr, &mut clen) != 0,
+                "InitializeContext() failed");
+        }
+
         Debugger {
             target_breakpoints: HashMap::new(),
             breakpoints:        HashMap::new(),
@@ -245,7 +290,12 @@ impl Debugger {
             always_freq:        false,
             last_db_save:       Instant::now(),
             verbose:            false,
-            pid,
+            bp_print:           false,
+            pid, start_time,
+
+            context:
+                unsafe { &mut *(context_backing.as_mut_ptr() as *mut CONTEXT) },
+            _context_backing:   context_backing, 
         }
     }
 
@@ -262,7 +312,7 @@ impl Debugger {
 
         if !cache_path.is_file() {
             if self.verbose {
-                print!("No meso in cache for {}, ignoring\n", path);
+                mprint!(self, "No meso in cache for {}, ignoring\n", path);
             }
             return;
         }
@@ -279,57 +329,84 @@ impl Debugger {
 
         let mut added_breakpoints = 0;
 
+        let start_time = Instant::now();
+
+        // Current module name we are processing
+        let mut cur_modname: Option<Arc<String>> = None;
+
         // Go through each line
-        for line in meso.lines() {
+        for line in meso.lines() {            
             // Parse the CSV
             let mut record: Vec<&str> =
-                line.split(SEPERATOR).collect();
-            
-            // Records should always be 4 columns
-            if record.len() == 4 {
-                // Validate the type
-                let typ = match record[0] {
-                    "freq"   => BreakpointType::Freq,
-                    "single" => BreakpointType::Single,
-                    _        => panic!("Invalid breakpoint type"),
-                };
+                line.split(SEPARATOR).collect();
 
-                // Get the module and offset
-                let module = String::from(record[1]).to_lowercase();
-                let offset = usize::from_str_radix(record[2], 16).unwrap();
+            // Module record
+            if record.len() == 2 && record[0] == "module" {
+                cur_modname = Some(Arc::new(record[1].to_string()));
+            } else if record.len() >= 3 {
+                let funcname = Arc::new(record[0].to_string());
+                let bdiff    = usize::from_str_radix(record[1], 16).unwrap();
 
-                // Create a new entry if none exist
-                if !self.target_breakpoints.contains_key(&module) {
-                    self.target_breakpoints.insert(module.clone(), Vec::new());
-                }
+                let module: &Arc<String> = cur_modname.as_ref().unwrap();
 
-                if !self.minmax_breakpoint.contains_key(&module) {
-                    self.minmax_breakpoint.insert(module.clone(), (!0, 0));
-                }
+                for ent in record[2..].iter() {
+                    let typ = match &ent[0..1] {
+                        "f" => BreakpointType::Freq,
+                        "s" => BreakpointType::Single,
+                        _   => panic!("Invalid breakpoint type"),
+                    };
 
-                let mmbp = self.minmax_breakpoint.get_mut(&module).unwrap();
-                mmbp.0 = std::cmp::min(mmbp.0, offset);
-                mmbp.1 = std::cmp::max(mmbp.1, offset);
-
-                // Append this breakpoint
-                self.target_breakpoints.get_mut(&module).unwrap().push(
-                    Breakpoint {
-                        offset:    offset,
-                        enabled:   false,
-                        typ:       typ,
-                        orig_byte: None,
-                        name:      Arc::new(record[3].into()),
-                        modname:   Arc::new(module),
+                    // Skip negative offsets. They can happen
+                    if &ent[1..2] == "-" {
+                        continue;
                     }
-                );
 
-                added_breakpoints += 1;
+                    // Get offset in function for this breakpoint
+                    let funcoff = usize::from_str_radix(&ent[1..], 16).unwrap();
+
+                    // Add function offset from module base to offset
+                    let offset  = bdiff + funcoff;
+
+                    // Create a new entry if none exist
+                    if !self.target_breakpoints.contains_key(&**module) {
+                        self.target_breakpoints.insert(module.to_string(), Vec::new());
+                    }
+
+                    if !self.minmax_breakpoint.contains_key(&**module) {
+                        self.minmax_breakpoint.insert(module.to_string(), (!0, 0));
+                    }
+
+                    let mmbp = self.minmax_breakpoint.get_mut(&**module).unwrap();
+                    mmbp.0 = std::cmp::min(mmbp.0, offset);
+                    mmbp.1 = std::cmp::max(mmbp.1, offset);
+
+                    // Append this breakpoint
+                    self.target_breakpoints.get_mut(&**module).unwrap().push(
+                        Breakpoint {
+                            offset:    offset,
+                            enabled:   false,
+                            typ:       typ,
+                            orig_byte: None,
+                            funcname:  funcname.clone(),
+                            funcoff:   funcoff,
+                            modname:   module.clone(),
+                        }
+                    );
+
+                    added_breakpoints += 1;
+                }
+            } else {
+                panic!("Unknown record in meso");
             }
         }
 
-        print!("Loaded meso file {:?}, requesting {} breakpoints when \
-               module is loaded\n",
-            meso_path, added_breakpoints);
+        if self.verbose {
+            let ef = elapsed_from(&start_time);
+            mprint!(self, "Loaded meso file {:?} in {:.6} seconds, requesting {} breakpoints when \
+                   module is loaded [{:.0} bps/sec]\n",
+                meso_path, ef, added_breakpoints,
+                added_breakpoints as f64 / ef);
+        }
     }
 
     /// Resolves the file name of a given memory mapped file in the target
@@ -361,16 +438,9 @@ impl Debugger {
         let mut image_header = [0u8; 4096];
 
         // Read the image header at `base`
-        unsafe {
-            let mut bread = 0;
-            assert!(memoryapi::ReadProcessMemory(
-                self.process_handle.unwrap(),
-                base as *const _,
-                image_header.as_mut_ptr() as *mut _,
-                image_header.len(),
-                &mut bread) != 0);
-            assert!(bread == image_header.len());
-        }
+        assert!(self.read_mem(base, &mut image_header) ==
+            std::mem::size_of_val(&image_header),
+            "Failed to read PE image header from target");
 
         // Validate this is a PE
         assert!(&image_header[0..2] == b"MZ", "File was not MZ");
@@ -384,6 +454,70 @@ impl Debugger {
 
         // Compute the meso name
         format!("cache\\{}_{:x}_{:x}.meso", filename, timestamp, imagesz)
+    }
+
+    /// Reads from `addr` in the process we're debugging into `buf`
+    /// Returns number of bytes read
+    pub fn read_mem(&self, addr: usize, buf: &mut [u8]) -> usize {
+        let mut offset = 0;
+
+        // Read until complete
+        while offset < buf.len() {
+            let mut bread = 0;
+
+            unsafe {
+                // Issue a read
+                if memoryapi::ReadProcessMemory(
+                        self.process_handle.unwrap(), (addr + offset) as *mut _,
+                        buf.as_mut_ptr().offset(offset as isize) as *mut _,
+                        buf.len() - offset, &mut bread) == 0 {
+                    // Return out on error
+                    return offset;
+                }
+                assert!(bread > 0);
+            }
+
+            offset += bread;
+        }
+
+        offset
+    }
+
+    /// Writes `buf` to `addr` in the process we're debugging
+    /// Returns number of bytes written
+    pub fn write_mem(&self, addr: usize, buf: &[u8]) -> usize {
+        let mut offset = 0;
+
+        // Write until complete
+        while offset < buf.len() {
+            let mut bread = 0;
+
+            unsafe {
+                // Issue a write
+                if memoryapi::WriteProcessMemory(
+                        self.process_handle.unwrap(), (addr + offset) as *mut _,
+                        buf.as_ptr().offset(offset as isize) as *const _,
+                        buf.len() - offset, &mut bread) == 0 {
+                    // Return out on error
+                    return offset;
+                }
+                assert!(bread > 0);
+            }
+
+            offset += bread;
+        }
+
+        offset
+    }
+
+    /// Flush all instruction caches in the target process
+    pub fn flush_instruction_caches(&self) {
+        unsafe {
+            // Flush all instruction caches for the process
+            assert!(processthreadsapi::FlushInstructionCache(
+                    self.process_handle.unwrap(),
+                    0 as *const _, 0) != 0);
+        }
     }
 
     pub fn register_module(&mut self, base: usize) {
@@ -421,7 +555,8 @@ impl Debugger {
             return;
         }
 
-        print!("Applying breakpoints for {}\n", filename);
+        // Save number of breakpoints at this function start
+        let startbps = self.breakpoints.len();
 
         let mut minmax = self.minmax_breakpoint[&filename];
 
@@ -435,16 +570,8 @@ impl Debugger {
         let mut contents = vec![0u8; region_size];
 
         // Read all memory of this DLL that includes breakpoints
-        unsafe {
-            let mut bread = 0;
-            assert!(memoryapi::ReadProcessMemory(
-                self.process_handle.unwrap(),
-                (base + minmax.0) as *const _,
-                contents.as_mut_ptr() as *mut _,
-                contents.len(),
-                &mut bread) != 0);
-            assert!(bread == contents.len());
-        }
+        // On partial reads that's fine, we'll only do a partial write later.
+        let _ = self.read_mem(base + minmax.0, &mut contents);
 
         // Attempt to apply all requested breakpoints
         for breakpoint in self.target_breakpoints.get(&filename).unwrap() {
@@ -469,23 +596,14 @@ impl Debugger {
         }
 
         // Write in all the breakpoints
-        unsafe {
-            let mut bwritten = 0;
-            assert!(memoryapi::WriteProcessMemory(
-                self.process_handle.unwrap(),
-                (base + minmax.0) as *mut _,
-                contents.as_ptr() as *const _,
-                contents.len(),
-                &mut bwritten) != 0);
-            assert!(bwritten == contents.len());
+        // If it partially writes then that's fine, we just apply the
+        // breakpoints we can
+        let _ = self.write_mem(base + minmax.0, &contents);
+        self.flush_instruction_caches();
 
-            // Flush all instruction caches for the process
-            assert!(processthreadsapi::FlushInstructionCache(
-                    self.process_handle.unwrap(),
-                    0 as *const _, 0) != 0);
-        }
-
-        print!("Now have {} breakpoints\n", self.breakpoints.len());
+        mprint!(self, "Applied {:10} breakpoints ({:10} total breakpoints) {}\n",
+            self.breakpoints.len() - startbps,
+            self.breakpoints.len(), filename);
 
         return;
     }
@@ -510,16 +628,9 @@ impl Debugger {
             let mut contents = vec![0u8; region_size];
 
             // Read all memory of this DLL that includes breakpoints
-            unsafe {
-                let mut bread = 0;
-                assert!(memoryapi::ReadProcessMemory(
-                    self.process_handle.unwrap(),
-                    (base + minmax.0) as *const _,
-                    contents.as_mut_ptr() as *mut _,
-                    contents.len(),
-                    &mut bread) != 0);
-                assert!(bread == contents.len());
-            }
+            // On partial reads that's fine, we'll only do a partial write
+            // later.
+            self.read_mem(base + minmax.0, &mut contents);
 
             let mut removed_bps = 0u64;
 
@@ -543,23 +654,12 @@ impl Debugger {
             }
 
             // Remove all the breakpoints
-            unsafe {
-                let mut bwritten = 0;
-                assert!(memoryapi::WriteProcessMemory(
-                    self.process_handle.unwrap(),
-                    (base + minmax.0) as *mut _,
-                    contents.as_ptr() as *const _,
-                    contents.len(),
-                    &mut bwritten) != 0);
-                assert!(bwritten == contents.len());
+            // On partial removes it's fine. If we can't write to the memory
+            // it's not mapped in, so we can just ignore partial writes here.
+            let _ = self.write_mem(base + minmax.0, &contents);
+            self.flush_instruction_caches();
 
-                // Flush all instruction caches for the process
-                assert!(processthreadsapi::FlushInstructionCache(
-                        self.process_handle.unwrap(),
-                        0 as *const _, 0) != 0);
-            }
-
-            print!("Removed {} breakpoints in {}\n", removed_bps, module);
+            mprint!(self, "Removed {} breakpoints in {}\n", removed_bps, module);
         }
 
         // Sanity check that all breakpoints have been removed
@@ -583,64 +683,53 @@ impl Debugger {
             //assert!(bp.enabled);
 
             let mut orig_byte = [0u8; 1];
-            let mut written   = 0usize;
-
             orig_byte[0] = bp.orig_byte.unwrap();
 
-            unsafe {
-                assert!(memoryapi::WriteProcessMemory(
-                    self.process_handle.unwrap(),
-                    addr as *mut _,
-                    orig_byte.as_ptr() as *const _,
-                    orig_byte.len(),
-                    &mut written) != 0);
-                assert!(written == orig_byte.len());
+            assert!(self.write_mem(addr, &orig_byte) == 1);
+            self.flush_instruction_caches();
 
-                // Flush all instruction caches for the process
-                assert!(processthreadsapi::FlushInstructionCache(
-                        self.process_handle.unwrap(), 0 as *const _, 0) != 0);
+            let funcoff = format!("{}+0x{:x}", bp.funcname, bp.funcoff);
 
-                if !self.coverage.contains_key(&addr) {
-                    self.coverage.insert(addr,
-                        (bp.modname.clone(), bp.offset, bp.name.clone(), 0));
-                }
-                let freq = {
-                    let bin = self.coverage.get_mut(&addr).unwrap();
-                    bin.3 += 1;
-                    bin.3
-                };
-
-                // Disable printing if we're doing always freq mode
-                if !self.always_freq {
-                    print!("{:8} of {:8} hit | {:10} freq | 0x{:x} | \
-                            {:>20}+0x{:08x} | {}\n",
-                        self.coverage.len(), self.breakpoints.len(),
-                        freq,
-                        addr, bp.modname, bp.offset, bp.name);
-                }
-
-                let mut context = self.get_context(tid);
-
-                // Back up so we re-execute where the breakpoint was
-
-                #[cfg(target_pointer_width = "64")]
-                { context.Rip = addr as u64; }
-
-                #[cfg(target_pointer_width = "32")]
-                { context.Eip = addr as u32; }
-
-                // Single step if this is a frequency instruction
-                if self.always_freq || bp.typ == BreakpointType::Freq {
-                    // Set the trap flag
-                    context.EFlags |= 1 << 8;
-                    self.single_step.insert(tid, addr);
-                } else {
-                    // Breakpoint no longer enabled
-                    bp.enabled = false;
-                }
-
-                self.set_context(tid, &context);
+            if !self.coverage.contains_key(&addr) {
+                self.coverage.insert(addr,
+                    (bp.modname.clone(), bp.offset, funcoff.clone(), 0));
             }
+            let freq = {
+                let bin = self.coverage.get_mut(&addr).unwrap();
+                bin.3 += 1;
+                bin.3
+            };
+
+            // Print coverage as we get it
+            if self.bp_print {
+                mprint!(self, "{:8} of {:8} hit | {:10} freq | 0x{:x} | \
+                        {:>20}+0x{:08x} | {}\n",
+                    self.coverage.len(), self.breakpoints.len(),
+                    freq,
+                    addr, bp.modname, bp.offset, funcoff);
+            }
+
+            self.get_context(tid);
+
+            // Back up so we re-execute where the breakpoint was
+
+            #[cfg(target_pointer_width = "64")]
+            { self.context.Rip = addr as u64; }
+
+            #[cfg(target_pointer_width = "32")]
+            { self.context.Eip = addr as u32; }
+
+            // Single step if this is a frequency instruction
+            if self.always_freq || bp.typ == BreakpointType::Freq {
+                // Set the trap flag
+                self.context.EFlags |= 1 << 8;
+                self.single_step.insert(tid, addr);
+            } else {
+                // Breakpoint no longer enabled
+                bp.enabled = false;
+            }
+
+            self.set_context(tid);
         } else {
             // Hit unexpected breakpoint
             return false;
@@ -650,46 +739,23 @@ impl Debugger {
     }
 
     /// Get a thread context
-    pub fn get_context(&mut self, tid: u32) -> CONTEXT {
+    pub fn get_context(&mut self, tid: u32) {
         unsafe {
-            // Correctly initialize a context so it's aligned. We overcommit
-            // with `buf` to give room for the CONTEXT to slide for alignment
-            let mut cptr: *mut CONTEXT = std::ptr::null_mut();
-            let mut buf = vec![0u8; std::mem::size_of::<CONTEXT>() + 4096];
-            let mut clen: u32 = buf.len() as u32;
-            assert!(InitializeContext(buf.as_mut_ptr() as *mut _, CONTEXT_ALL, 
-                              &mut cptr, &mut clen) != 0,
-                              "InitializeContext() failed");
-
             assert!(processthreadsapi::GetThreadContext(
-                    self.thread_handles[&tid], cptr) != 0);
-            
-            *cptr
+                    self.thread_handles[&tid], self.context) != 0);
         }
     }
 
     /// Set a thread context
-    pub fn set_context(&mut self, tid: u32, context: &CONTEXT) {
+    pub fn set_context(&mut self, tid: u32) {
         unsafe {
-            // Correctly initialize a context so it's aligned. We overcommit
-            // with `buf` to give room for the CONTEXT to slide for alignment
-            let mut cptr: *mut CONTEXT = std::ptr::null_mut();
-            let mut buf = vec![0u8; std::mem::size_of::<CONTEXT>() + 4096];
-            let mut clen: u32 = buf.len() as u32;
-            assert!(InitializeContext(buf.as_mut_ptr() as *mut _, CONTEXT_ALL, 
-                              &mut cptr, &mut clen) != 0,
-                              "InitializeContext() failed");
-
-            // Copy requested context to aligned context
-            *cptr = *context;
-
             assert!(processthreadsapi::SetThreadContext(
-                    self.thread_handles[&tid], cptr) != 0);
+                    self.thread_handles[&tid], self.context) != 0);
         }
     }
 
     /// Get a filename to describe a given crash
-    pub fn get_crash_filename(&mut self, context: &CONTEXT,
+    pub fn get_crash_filename(&self, context: &CONTEXT,
                               exception: &EXCEPTION_RECORD) -> String {
         let pc = {
             #[cfg(target_pointer_width = "64")]
@@ -766,10 +832,12 @@ impl Debugger {
 
     /// Sync the coverage database to disk
     pub fn flush_coverage_database(&mut self) {
-        print!("Syncing code coverage database...\n");
+        mprint!(self, "Syncing code coverage database...\n");
 
-        let mut fd = File::create("coverage.txt")
-            .expect("Failed to open freq coverage file");
+        let mut fd = BufWriter::with_capacity(
+            2 * 1024 * 1024,
+            File::create("coverage.txt")
+                .expect("Failed to open freq coverage file"));
 
         for (pc, (module, offset, symoff, freq)) in self.coverage.iter() {
             write!(fd,
@@ -779,7 +847,8 @@ impl Debugger {
                 .expect("Failed to write coverage info");
         }
 
-        print!("Sync complete\n");
+        mprint!(self, "Sync complete ({} total unique coverage entries)\n",
+            self.coverage.len());
     }
 
     /// Run the process forever
@@ -815,7 +884,7 @@ impl Debugger {
             let pid = event.dwProcessId;
             let tid = event.dwThreadId;
 
-            //print!("{:?}\n", event);
+            //mprint!(self, "{:?}\n", event);
 
             match event.dwDebugEventCode {
                 CREATE_PROCESS_DEBUG_EVENT => {
@@ -859,18 +928,18 @@ impl Debugger {
                         if !self.handle_breakpoint(tid,
                                 exception.ExceptionRecord
                                 .ExceptionAddress as usize) {
-                            print!(
+                            mprint!(self, 
                                 "Warning: Continuing unexpected 0x80000003\n");
                         }
                     } else {
                         if exception.ExceptionRecord.ExceptionCode ==
                                 0xc0000005 {
-                            let mut context = self.get_context(tid);
+                            self.get_context(tid);
 
                             let filename = self.get_crash_filename(
-                                &context, &mut exception.ExceptionRecord);
+                                &self.context, &mut exception.ExceptionRecord);
 
-                            print!("Got crash: {}\n", filename);
+                            mprint!(self, "Got crash: {}\n", filename);
 
                             if !Path::new(&filename).is_file() {
                                 // Remove all breakpoints in the program
@@ -880,7 +949,7 @@ impl Debugger {
                                 dump(&filename, pid, tid,
                                      self.process_handle.unwrap(),
                                      &mut exception.ExceptionRecord,
-                                     &mut context);
+                                     &mut self.context);
                             }
 
                             // Exit out
@@ -892,30 +961,19 @@ impl Debugger {
 
                             if let Some(&pc) = self.single_step.get(&tid) {
                                 // Disable trap flag
-                                let mut context = self.get_context(tid);
-                                context.EFlags &= !(1 << 8);
-                                self.set_context(tid, &context);
+                                self.get_context(tid);
+                                self.context.EFlags &= !(1 << 8);
+                                self.set_context(tid);
 
-                                let mut written = 0usize;
-
-                                assert!(memoryapi::WriteProcessMemory(
-                                    self.process_handle.unwrap(),
-                                    pc as *mut _,
-                                    b"\xcc".as_ptr() as *const _,
-                                    1,
-                                    &mut written) != 0);
-                                assert!(written == 1);
-
-                                // Flush all instruction caches for the process
-                                assert!(
-                                    processthreadsapi::FlushInstructionCache(
-                                        self.process_handle.unwrap(),
-                                        0 as *const _, 0) != 0);
+                                // Write breakpoint back in
+                                assert!(self.write_mem(pc, b"\xcc") == 1);
+                                self.flush_instruction_caches();
 
                                 // Remove that we're single stepping this TID
                                 self.single_step.remove(&tid);
                             } else {
-                                print!("Unexpected single step, continuing\n");
+                                mprint!(self, "Unexpected single step, \
+                                    continuing\n");
                             }
 
                             assert!(debugapi::ContinueDebugEvent(
@@ -923,6 +981,9 @@ impl Debugger {
                             continue;
                         } else {
                             // Unhandled exception
+                            print!("Unhandled exception {:x}\n",
+                                exception.ExceptionRecord.ExceptionCode);
+
                             assert!(debugapi::ContinueDebugEvent(
                                     pid, tid, DBG_EXCEPTION_NOT_HANDLED) != 0);
                             continue;
@@ -940,7 +1001,7 @@ impl Debugger {
                     self.thread_handles.remove(&tid);
                 }
                 EXIT_PROCESS_DEBUG_EVENT => {
-                    print!("Process exited, qutting!\n");
+                    mprint!(self, "Process exited, qutting!\n");
                     return 0;
                 }
                 UNLOAD_DLL_DEBUG_EVENT => {
@@ -968,6 +1029,12 @@ fn win32_string(value : &str) -> Vec<u16> {
 /// Create a full minidump of a given process
 pub fn dump(filename: &str, pid: u32, tid: u32, process: HANDLE,
             exception: &mut EXCEPTION_RECORD, context: &mut CONTEXT) {
+    // Don't overwrite existing dumps
+    if Path::new(filename).is_file() {
+        print!("Ignoring duplicate crash {}\n", filename);
+        return;
+    }
+
     unsafe {
         let filename = win32_string(filename);
 
@@ -1032,7 +1099,7 @@ pub fn sedebug() {
     }
 }
 
-impl Drop for Debugger {
+impl<'a> Drop for Debugger<'a> {
     fn drop(&mut self) {
         // Remove all breakpoints
         self.remove_breakpoints();
@@ -1054,12 +1121,14 @@ impl Drop for Debugger {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        print!("Usage: mesos.exe <pid> [--freq | --verbose] \
+        print!("Usage: mesos.exe <pid> [--freq | --verbose | --print] \
                <explicit meso file 1> <explicit meso file ...>\n");
         print!("    --freq               - \
                Treats all breakpoints as frequency breakpoints\n");
         print!("    --verbose            - \
                Enables verbose prints for debugging\n");
+        print!("    --print              - \
+               Prints breakpoint info on every single breakpoint\n");
         print!("    [explicit meso file] - \
                Load a specific meso file regardless of loaded modules\n\n");
 
@@ -1090,6 +1159,11 @@ fn main() {
                 print!("Verbose mode enabled\n");
                 dbg.verbose = true;
                 continue;
+            } else if meso == "--print" {
+                // Enable breakpoint print mode
+                print!("Breakpoint print mode enabled\n");
+                dbg.bp_print = true;
+                continue;
             }
 
             // Load explicit meso file
@@ -1100,4 +1174,3 @@ fn main() {
     // Debug forever
     dbg.run();
 }
-

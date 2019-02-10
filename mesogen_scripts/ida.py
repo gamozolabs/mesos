@@ -9,36 +9,35 @@ print("Analysis done, generating meso")
 
 image_base = idaapi.get_imagebase()
 
-output = bytearray()
-
-SEPERATOR = "~~ed6ed28d321bbdc8~~"
+SEPARATOR = "\0"
 
 input_name = GetInputFile()
-
 if len(ARGV) >= 4 and ARGV[1] == "cmdline":
     input_name = ARGV[3]
-
-for funcea in Functions():
-    f  = idaapi.get_func(funcea)
-    fc = idaapi.FlowChart(f)
-
-    for block in fc:
-        if is_code(getFlags(block.startEA)):
-            output += "%s%s%s%s%x%s%s\n" % \
-                    ("single", SEPERATOR,
-                     input_name, SEPERATOR,
-                     block.startEA - image_base, SEPERATOR,
-                     get_func_off_str(block.startEA))
 
 filename = "%s/%s.meso" % (os.path.dirname(os.path.abspath(__file__)), input_name)
 if len(ARGV) >= 4 and ARGV[1] == "cmdline":
     filename = ARGV[2]
+filename += ".tmp"
 
-open(filename, "wb").write(output)
+with open(filename, "wb") as fd:
+    fd.write("module%s%s\n" % (SEPARATOR, input_name))
 
-print("Generated meso: %s" % filename)
+    for funcea in Functions():
+        fd.write("%s%s%x" % (get_func_off_str(funcea),
+            SEPARATOR, funcea - image_base))
+
+        for block in idaapi.FlowChart(idaapi.get_func(funcea)):
+            if is_code(getFlags(block.startEA)):
+                fd.write("%ss%x" % (SEPARATOR, block.startEA - funcea))
+        
+        fd.write("\n")
+
+# Rename .tmp file to actual name
+os.rename(filename, filename[:-4])
+
+print("Generated meso: %s" % filename[:-4])
 
 # Exit only if we were invoked from the command line
 if len(ARGV) >= 4 and ARGV[1] == "cmdline":
     idc.Exit(0)
-
