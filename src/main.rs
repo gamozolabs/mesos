@@ -40,6 +40,7 @@ use winapi::um::processthreadsapi::GetCurrentProcess;
 use winapi::um::wow64apiset::IsWow64Process;
 use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
 use winapi::um::processthreadsapi::OpenProcess;
+use winapi::um::psapi::GetMappedFileNameW;
 
 use std::time::{Duration, Instant};
 use std::collections::{HashSet, HashMap};
@@ -248,52 +249,16 @@ impl Debugger {
         }
     }
 
-    /// Loads all breakpoints applicable to the file represented by the handle
-    pub fn load_breakpoints(&mut self, handle: HANDLE) {
-        // Get the filename from the handle
-        let mut buf = [0u16; 4096];
-        let fnlen = unsafe {
-            fileapi::GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(),
-                buf.len() as u32 - 1, 0)
-        };
-        assert!(fnlen != 0);
-
-        // Convert the name to utf-8 and lowercase it
-        let path = String::from_utf16(&buf[..fnlen as usize]).unwrap()
-            .to_lowercase();
-
+    /// Loads all breakpoints applicable to the mapped file at `base`
+    pub fn load_breakpoints(&mut self, base: usize) {
+        let path = self.compute_cached_meso_name(base);
         self.load_meso_from_cache(path);
     }
 
-    /// Load a meso from the cache, this will find the correct name for the
-    /// cache file by parsing the timestamp and imagesz from the PE
+    /// Load a meso from the cache based on `path`
     pub fn load_meso_from_cache(&mut self, path: String) {
-        // All paths we get should be UNC
-        // We expect \\?\<letter>:\
-        assert!(&path[..4] == "\\\\?\\");
-        assert!(path.chars().nth(4).unwrap().is_ascii_alphabetic());
-        assert!(&path[5..7] == ":\\");
-
-        // Strip the UNC prefix
-        let non_unc_path = &path[4..];
-
-        // Get the file contents
-        let file_contents = std::fs::read(non_unc_path)
-            .expect("Failed to read module");
-        assert!(&file_contents[0..2] == b"MZ", "File was not MZ");
-        let pe_ptr = u32_from_slice(&file_contents[0x3c..0x40]) as usize;
-        assert!(&file_contents[pe_ptr..pe_ptr+4] == b"PE\0\0");
-
-        let timestamp = u32_from_slice(&file_contents[pe_ptr+8..pe_ptr+0xc]);
-        let imagesz   =
-            u32_from_slice(&file_contents[pe_ptr+0x18+0x38..pe_ptr+0x18+0x3c]);
-
-        // Compute the meso name
-        let cache_name = format!("cache\\{}_{:x}_{:x}.meso",
-            non_unc_path.replace(":", "_"), timestamp, imagesz);
-
         // Create the cache file name
-        let cache_path = Path::new(&cache_name);
+        let cache_path = Path::new(&path);
 
         if !cache_path.is_file() {
             if self.verbose {
@@ -367,21 +332,62 @@ impl Debugger {
             meso_path, added_breakpoints);
     }
 
-    pub fn register_module(&mut self, base: usize, handle: HANDLE) {
-        // Get the filename from the handle
+    /// Resolves the file name of a given memory mapped file in the target
+    /// process
+    pub fn filename_from_module_base(&self, base: usize) -> String {
+        // Use GetMappedFileNameW() to get the mapped file name
         let mut buf = [0u16; 4096];
         let fnlen = unsafe {
-            fileapi::GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(),
-                buf.len() as u32 - 1, 0)
+            GetMappedFileNameW(self.process_handle.unwrap(),
+                base as *mut _, buf.as_mut_ptr(), buf.len() as u32)
         };
-        assert!(fnlen != 0);
+        assert!(fnlen != 0 && (fnlen as usize) < buf.len(),
+            "GetMappedFileNameW() failed");
 
         // Convert the name to utf-8 and lowercase it
         let path = String::from_utf16(&buf[..fnlen as usize]).unwrap()
             .to_lowercase();
 
         // Get the filename from the path
-        let filename = Path::new(&path).file_name().unwrap().to_str().unwrap();
+        Path::new(&path).file_name().unwrap().to_str().unwrap().into()
+    }
+
+    /// Computes the path to the cached meso filename for a given module loaded
+    /// at `base`
+    pub fn compute_cached_meso_name(&self, base: usize) -> String {
+        // Get base filename
+        let filename = self.filename_from_module_base(base);
+        
+        let mut image_header = [0u8; 4096];
+
+        // Read the image header at `base`
+        unsafe {
+            let mut bread = 0;
+            assert!(memoryapi::ReadProcessMemory(
+                self.process_handle.unwrap(),
+                base as *const _,
+                image_header.as_mut_ptr() as *mut _,
+                image_header.len(),
+                &mut bread) != 0);
+            assert!(bread == image_header.len());
+        }
+
+        // Validate this is a PE
+        assert!(&image_header[0..2] == b"MZ", "File was not MZ");
+        let pe_ptr = u32_from_slice(&image_header[0x3c..0x40]) as usize;
+        assert!(&image_header[pe_ptr..pe_ptr+4] == b"PE\0\0");
+
+        // Get TimeDateStamp and ImageSize from the PE header
+        let timestamp = u32_from_slice(&image_header[pe_ptr+8..pe_ptr+0xc]);
+        let imagesz   =
+            u32_from_slice(&image_header[pe_ptr+0x50..pe_ptr+0x54]);
+
+        // Compute the meso name
+        format!("cache\\{}_{:x}_{:x}.meso", filename, timestamp, imagesz)
+    }
+
+    pub fn register_module(&mut self, base: usize) {
+        let filename = self.filename_from_module_base(base);
 
         // Insert into the module list
         self.modules.insert((filename.into(), base));
@@ -407,30 +413,17 @@ impl Debugger {
         }
     }
 
-    pub fn apply_breakpoints(&mut self, base: usize, handle: HANDLE) {
-        // Get the filename from the handle
-        let mut buf = [0u16; 4096];
-        let fnlen = unsafe {
-            fileapi::GetFinalPathNameByHandleW(handle, buf.as_mut_ptr(),
-                buf.len() as u32 - 1, 0)
-        };
-        assert!(fnlen != 0);
-
-        // Convert the name to utf-8 and lowercase it
-        let path = String::from_utf16(&buf[..fnlen as usize]).unwrap()
-            .to_lowercase();
-
-        // Get the filename from the path
-        let filename = Path::new(&path).file_name().unwrap().to_str().unwrap();
+    pub fn apply_breakpoints(&mut self, base: usize) {
+        let filename = self.filename_from_module_base(base);
 
         // Bail if we don't have requested breakpoints for this module
-        if !self.minmax_breakpoint.contains_key(filename) {
+        if !self.minmax_breakpoint.contains_key(&filename) {
             return;
         }
 
-        print!("Applying breakpoints for {}\n", path);
+        print!("Applying breakpoints for {}\n", filename);
 
-        let mut minmax = self.minmax_breakpoint[filename];
+        let mut minmax = self.minmax_breakpoint[&filename];
 
         // Convert this to a non-inclusive upper bound
         minmax.1 = minmax.1.checked_add(1).unwrap();
@@ -454,7 +447,7 @@ impl Debugger {
         }
 
         // Attempt to apply all requested breakpoints
-        for breakpoint in self.target_breakpoints.get(filename).unwrap() {
+        for breakpoint in self.target_breakpoints.get(&filename).unwrap() {
             let mut bp = breakpoint.clone();
             bp.enabled = true;
 
@@ -835,14 +828,13 @@ impl Debugger {
                         create_process.hThread);
 
                     self.register_module(
-                        create_process.lpBaseOfImage as usize,
-                        create_process.hFile);
+                        create_process.lpBaseOfImage as usize);
 
-                    self.load_breakpoints(create_process.hFile);
+                    self.load_breakpoints(
+                        create_process.lpBaseOfImage as usize);
 
                     self.apply_breakpoints(
-                        create_process.lpBaseOfImage as usize,
-                        create_process.hFile);
+                        create_process.lpBaseOfImage as usize);
                 }
                 CREATE_THREAD_DEBUG_EVENT => {
                     let create_thread = event.u.CreateThread();
@@ -940,14 +932,9 @@ impl Debugger {
                 LOAD_DLL_DEBUG_EVENT => {
                     let load_dll = event.u.LoadDll();
 
-                    self.register_module(
-                        load_dll.lpBaseOfDll as usize,
-                        load_dll.hFile);
-                    
-                    self.load_breakpoints(load_dll.hFile);
-
-                    self.apply_breakpoints(
-                        load_dll.lpBaseOfDll as usize, load_dll.hFile);
+                    self.register_module(load_dll.lpBaseOfDll as usize);
+                    self.load_breakpoints(load_dll.lpBaseOfDll as usize);
+                    self.apply_breakpoints(load_dll.lpBaseOfDll as usize);
                 }
                 EXIT_THREAD_DEBUG_EVENT => {
                     self.thread_handles.remove(&tid);
