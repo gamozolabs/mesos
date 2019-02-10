@@ -144,11 +144,19 @@ ida_probe()
 
 args = sys.argv[1:]
 
-# Super secret option, use a custom zipfile as input
-if len(args) >= 2:
+# Super secret options
+while len(args) >= 2:
     if args[0] == "--zipfile":
+        # Use a custom zipfile as input
         PREP_ZIP = args[1]
         args = args[2:]
+        continue
+    elif args[0] == "--threads":
+        # Change the number of worker jobs for meso generation
+        MAX_JOBS = int(args[1])
+        args = args[2:]
+        continue
+    break
 
 if len(args) == 1 and args[0] == "process_ida":
     process(None, None)
@@ -158,4 +166,3 @@ elif len(args) >= 2 and args[0] == "process_ida_blacklist":
     process(None, args[1:])
 else:
     usage()
-

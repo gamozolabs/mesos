@@ -54,11 +54,6 @@ use std::iter::once;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::io::BufWriter;
 
-/// Separator used in mesos files
-/// This is just a "random" string to allow us to not have to worry about
-/// escaping strings that contain our separator. We just split on this
-const SEPARATOR: &str = "\0";
-
 /// Tracks if an exit has been requested via the Ctrl+C/Ctrl+Break handler
 static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
@@ -324,7 +319,7 @@ impl<'a> Debugger<'a> {
     /// Load a meso file, declaring the breakpoints to apply
     pub fn load_meso(&mut self, meso_path: &Path) {
         // Read the file
-        let meso = std::fs::read_to_string(meso_path)
+        let meso: Vec<u8> = std::fs::read(meso_path)
             .expect("Failed to read meso");
 
         let mut added_breakpoints = 0;
@@ -334,38 +329,57 @@ impl<'a> Debugger<'a> {
         // Current module name we are processing
         let mut cur_modname: Option<Arc<String>> = None;
 
-        // Go through each line
-        for line in meso.lines() {            
-            // Parse the CSV
-            let mut record: Vec<&str> =
-                line.split(SEPARATOR).collect();
+        let mut ptr = &meso[..];
 
-            // Module record
-            if record.len() == 2 && record[0] == "module" {
-                cur_modname = Some(Arc::new(record[1].to_string()));
-            } else if record.len() >= 3 {
-                let funcname = Arc::new(record[0].to_string());
-                let bdiff    = usize::from_str_radix(record[1], 16).unwrap();
+        macro_rules! read {
+            ($ty:ty) => {{
+                let mut array = [0; std::mem::size_of::<$ty>()];
+                array.copy_from_slice(&ptr[..std::mem::size_of::<$ty>()]);
+                ptr = &ptr[std::mem::size_of::<$ty>()..];
+                <$ty>::from_le_bytes(array)
+            }};
+        }
 
+        while ptr.len() > 0 {        
+            // Get record type
+            let record = read!(u8);
+
+            if record == 0 {
+                // Module record
+                let modname_len = read!(u16);
+
+                // Convert name to Rust str
+                let modname = std::str::from_utf8(&ptr[..modname_len as usize])
+                    .expect("Module name was not valid UTF-8");
+                ptr = &ptr[modname_len as usize..];
+
+                cur_modname = Some(Arc::new(modname.into()));
+            } else if record == 1 {
+                // Current module name state
                 let module: &Arc<String> = cur_modname.as_ref().unwrap();
 
-                for ent in record[2..].iter() {
-                    let typ = match &ent[0..1] {
-                        "f" => BreakpointType::Freq,
-                        "s" => BreakpointType::Single,
-                        _   => panic!("Invalid breakpoint type"),
-                    };
+                // Function record
+                let funcname_len = read!(u16);
 
-                    // Skip negative offsets. They can happen
-                    if &ent[1..2] == "-" {
-                        continue;
-                    }
+                // Convert name to Rust str
+                let funcname: Arc<String> =
+                    Arc::new(std::str::from_utf8(&ptr[..funcname_len as usize])
+                        .expect("Function name was not valid UTF-8")
+                        .to_string());
+                ptr = &ptr[funcname_len as usize..];
 
-                    // Get offset in function for this breakpoint
-                    let funcoff = usize::from_str_radix(&ent[1..], 16).unwrap();
+                // Get function offset from module base
+                let funcoff = read!(u64);
+
+                // Get number of basic blocks
+                let num_blocks = read!(u32) as usize;
+
+                // Iterate over all block offsets
+                for _ in 0..num_blocks {
+                    let blockoff = read!(i32) as i64 as u64;
 
                     // Add function offset from module base to offset
-                    let offset  = bdiff + funcoff;
+                    let offset = funcoff.wrapping_add(blockoff);
 
                     // Create a new entry if none exist
                     if !self.target_breakpoints.contains_key(&**module) {
@@ -377,18 +391,18 @@ impl<'a> Debugger<'a> {
                     }
 
                     let mmbp = self.minmax_breakpoint.get_mut(&**module).unwrap();
-                    mmbp.0 = std::cmp::min(mmbp.0, offset);
-                    mmbp.1 = std::cmp::max(mmbp.1, offset);
+                    mmbp.0 = std::cmp::min(mmbp.0, offset as usize);
+                    mmbp.1 = std::cmp::max(mmbp.1, offset as usize);
 
                     // Append this breakpoint
                     self.target_breakpoints.get_mut(&**module).unwrap().push(
                         Breakpoint {
-                            offset:    offset,
+                            offset:    offset as usize,
                             enabled:   false,
-                            typ:       typ,
+                            typ:       BreakpointType::Single,
                             orig_byte: None,
                             funcname:  funcname.clone(),
-                            funcoff:   funcoff,
+                            funcoff:   funcoff as usize,
                             modname:   module.clone(),
                         }
                     );
@@ -396,7 +410,7 @@ impl<'a> Debugger<'a> {
                     added_breakpoints += 1;
                 }
             } else {
-                panic!("Unknown record in meso");
+                panic!("Unhandled record");
             }
         }
 

@@ -29,7 +29,7 @@ for thing in fft.finditer(inp):
     offset = int(thing.group(3), 16)
 
     # Skip non-matching modules
-    if module.lower() != ida_modname:
+    if module.lower() not in ida_modname:
         continue
 
     freqs[image_base + offset] = freq
