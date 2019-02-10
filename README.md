@@ -6,6 +6,14 @@ Mesos is a tool to gather binary code coverage on all user-land Windows targets 
 
 Mesos is technically just a really fast debugger, capable of handling tens of millions of breakpoints. Using this debugger, we apply breakpoints to every single basic block in a program. These breakpoints are removed as they are hit. Thus, mesos converges to 0-cost coverage as gathering coverage only has a cost the first time the basic block is hit.
 
+# Why?
+
+This is effectively the successor of my 5+ year old Chrome IPC fuzzer. It doesn't have any fuzz components in it, but it is a high-performance debugger. This debugger can apply millions of breakpoints to gather coverage, and handle thousands of breakpoints per second to modify memory to inject inputs.
+
+This strategy has worked out well for me historically and still is my go-to tooling for fuzzing targets on live systems.
+
+Out of the box it can be used to gather simple code coverage but it's designed to be easily modified to add fast breakpoint handlers to inject inputs. For example, put a breakpoint after `NtReadFile()` returns and modify the buffer in flight. I used this in Chrome to modify inbound IPC traffic in the browser.
+
 # Features
 
 ## Code coverage
@@ -219,13 +227,43 @@ When running in `cargo run` the Ctrl+C handler does not work correctly, and does
 
 Since this relies on a tool (IDA) to identify blocks, if the tool incorrectly identifies a block it could result in us inserting a breakpoint over data. Further it's possible to miss coverage if a block is not correctly found.
 
+# Why doesn't it do more?
+
+Well. It really just allows fast breakpoints. Feel free to rip it apart and add your own hooks to functions. It could easily be used to fuzz things :)
+
 # Why IDA?
 
 I tried a bunch of tools and IDA was the only one that seemed to work well. Binja probably would also work well but I don't have it installed and I'm not familiar with the API. I have a coworker who wrote a plugin for it and that'll probably get pull requested in soon.
 
 _The meso files are just simple files, anyone can generate them from any tool_
 
-# Technical Details / Meso file format
+# Technical Details
+
+## Minidump autogenned filenames
+
+The generated minidump filenames are designed to give a high-level of glance value at crashes. It includes things like the exception type, faulting address, and rough classification of the bug.
+
+Currently if it's an access violation we apply the following classification:
+
+- Determine the access type (read, write, execute)
+    - For reads the filename contains: "read"
+    - For writes the filename contains: "WRITE"
+    - For execute the filename contains: "DEP"
+- Determine if it's a non-canonical 64-bit address
+    - For non-canonical addresses the filename contains: NONCANON
+- Otherwise determine if it's a NULL dereference (within 32 KiB +- of NULL)
+    - Will put "null" in the filename
+- Otherwise it's considered a non-null deref and "HIGH" appears in the filename
+
+It's intended that more severe things are in all caps to give higher glance value of prioritizing which crash dumps to look into more.
+
+Example minidump filename for chrome:
+
+```
+crash_c0000005_chrome_child.dll+0x2c915c0_WRITE_null.dmp
+```
+
+## Meso file format
 
 Coming soon (once it's stable)
 
