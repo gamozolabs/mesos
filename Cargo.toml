@@ -1,0 +1,11 @@
+[package]
+name = "mesos"
+version = "0.1.0"
+authors = ["bfalk"]
+
+[dependencies]
+winapi = { version = "0.3.5", features = ["debugapi", "winbase", "memoryapi", "processthreadsapi", "errhandlingapi", "handleapi", "securitybaseapi", "consoleapi", "winerror", "wow64apiset"] }
+
+[profile.release]
+debug = true
+
