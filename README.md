@@ -106,7 +106,7 @@ cache\c_\program files (x86)\common files\adobe\coresyncextension\coresync_x64.d
 ...
 ```
 
-# Generating meso files
+## Generating meso files
 
 To generate meso files we operate on the `meso_deps.zip` we created in the last step. It doesn't matter where this zip came from. This allows the zip to have come from a VM that the PowerShell script was run on.
 
@@ -122,7 +122,11 @@ This will create a cache folder with a bunch of files in it. These files are nam
 
 You'll see there are files with no extension (these are the original binaries), there are files with `.meso` extensions (the breakpoint lists), and `.i64` files (the cached IDA database for the original binary).
 
-## More advanced usage
+### Symbol resolution
+
+There is no limitation on what can make these meso files. The quality of the symbol resolution depends on the tool you used to generate and it's ability to resolve symbols. For example with IDA if you have public/private symbols your `_NT_SYMBOL_PATH` should be configured correctly.
+
+### More advanced usage
 
 Check the programs usage for the most recent usage. But there are `_whitelist` and `_blacklist` options that allow you to use a list of strings to filter the amount of mesos generated.
 
@@ -166,7 +170,7 @@ Processing cache/c_/windows/system32/windows.storage.dll
 Processing cache/c_/windows/system32/wintypes.dll
 ```
 
-# Meso usage
+## Meso usage
 
 Now we're onto the actual debugger. We've created meso files to tell it where to put breakpoints in each module.
 
@@ -182,7 +186,7 @@ And then we can simply run it with a PID!
 target\release\mesos.exe <pid>
 ```
 
-## Command-line options
+### Command-line options
 
 Currently there are few options to mesos, run mesos without arguments to get the most recent list.
 
