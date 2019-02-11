@@ -903,7 +903,7 @@ impl<'a> Debugger<'a> {
 
                     // Wrap up the hFile handle. We don't use it but this will
                     // cause it to get dropped automatically for us
-                    //let _ = Handle::new(create_process.hFile);
+                    let _ = Handle::new(create_process.hFile);
 
                     // Make sure the hProcess and hThread are valid
                     assert!(
