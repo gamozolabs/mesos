@@ -6,25 +6,8 @@ pub mod sedebug;
 pub mod ffi_helpers;
 pub mod handles;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 use std::path::Path;
 use debugger::Debugger;
-use winapi::um::consoleapi::SetConsoleCtrlHandler;
-
-/// Tracks if an exit has been requested via the Ctrl+C/Ctrl+Break handler
-static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-/// Ctrl+C handler so we can remove breakpoints and detach from the debugger
-unsafe extern "system" fn ctrl_c_handler(_ctrl_type: u32) -> i32 {
-    // Store that an exit was requested
-    EXIT_REQUESTED.store(true, Ordering::SeqCst);
-
-    // Sleep forever
-    loop {
-        std::thread::sleep(Duration::from_secs(100));
-    }
-}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -42,15 +25,6 @@ fn main() {
 
         print!("Standard usage: mesos.exe <pid>\n");
         return;
-    }
-
-    // Enable ability to debug system services
-    crate::sedebug::sedebug();
-
-    // Register ctrl-c handler
-    unsafe {
-        assert!(SetConsoleCtrlHandler(Some(ctrl_c_handler), 1) != 0,
-            "SetConsoleCtrlHandler() failed");
     }
 
     // Attach to process

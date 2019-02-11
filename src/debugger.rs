@@ -41,11 +41,25 @@ use std::sync::Arc;
 use std::fs::File;
 use std::io::Write;
 use std::io::BufWriter;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use winapi::um::consoleapi::SetConsoleCtrlHandler;
+
 use minidump::dump;
 use handles::Handle;
 
-use crate::EXIT_REQUESTED;
+/// Tracks if an exit has been requested via the Ctrl+C/Ctrl+Break handler
+static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Ctrl+C handler so we can remove breakpoints and detach from the debugger
+unsafe extern "system" fn ctrl_c_handler(_ctrl_type: u32) -> i32 {
+    // Store that an exit was requested
+    EXIT_REQUESTED.store(true, Ordering::SeqCst);
+
+    // Sleep forever
+    loop {
+        std::thread::sleep(Duration::from_secs(100));
+    }
+}
 
 /// Different types of breakpoints
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -166,6 +180,15 @@ impl<'a> Debugger<'a> {
     pub fn attach(pid: u32) -> Debugger<'a> {
         // Save the start time
         let start_time = Instant::now();
+
+        // Enable ability to debug system services
+        crate::sedebug::sedebug();
+
+        // Register ctrl-c handler
+        unsafe {
+            assert!(SetConsoleCtrlHandler(Some(ctrl_c_handler), 1) != 0,
+                "SetConsoleCtrlHandler() failed");
+        }
 
         unsafe {
             let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
