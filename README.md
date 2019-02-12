@@ -69,6 +69,10 @@ target is 64-bit: true
 [      0.732045] Applied      28569 breakpoints (   1613879 total breakpoints) iertutil.dll
 ```
 
+# API
+
+Currently this tool has a `debugger` lib you can easily bring in and start using to make custom debuggers. However this API is not finalized yet. I suggest not building anything using it yet as it may change very quickly. Once this message is removed it's probably stable :)
+
 # Performance
 
 - We can register (request breakpoints to be at module load) about ~6 million/second
