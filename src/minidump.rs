@@ -85,7 +85,7 @@ pub fn dump(filename: &str, pid: u32, tid: u32, process: HANDLE,
         assert!(fd != INVALID_HANDLE_VALUE, "Failed to create dump file");
 
         // Wrap up the HANDLE for drop tracking
-        let fd = Handle::new(fd);
+        let fd = Handle::new(fd).expect("Failed to get handle to minidump");
 
         let mei = MinidumpExceptionInformation {
             thread_id:       tid,
@@ -96,15 +96,7 @@ pub fn dump(filename: &str, pid: u32, tid: u32, process: HANDLE,
         // Take a minidump!
         let res = MiniDumpWriteDump(process, pid, fd.raw(), 
             MinidumpType::MiniDumpWithFullMemory as u32 |
-            MinidumpType::MiniDumpWithHandleData as u32 |
-            MinidumpType::MiniDumpWithUnloadedModules as u32 |
-            MinidumpType::MiniDumpWithProcessThreadData as u32 |
-            MinidumpType::MiniDumpWithFullMemoryInfo as u32 |
-            MinidumpType::MiniDumpWithThreadInfo as u32 |
-            MinidumpType::MiniDumpWithFullAuxiliaryState as u32 |
-            MinidumpType::MiniDumpWithTokenInformation as u32 |
-            MinidumpType::MiniDumpWithModuleHeaders as u32 |
-            MinidumpType::MiniDumpFilterTriage as u32,
+            MinidumpType::MiniDumpWithHandleData as u32,
             &mei, 0, 0);
         assert!(res != 0, "MiniDumpWriteDump error: {}\n", GetLastError());
     }

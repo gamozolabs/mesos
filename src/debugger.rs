@@ -195,7 +195,7 @@ impl<'a> Debugger<'a> {
             assert!(handle != std::ptr::null_mut(), "OpenProcess() failed");
 
             // Wrap up the handle for drop tracking
-            let handle = Handle::new(handle);
+            let handle = Handle::new(handle).expect("Failed to get handle");
 
             let mut cur_is_wow64    = 0i32;
             let mut target_is_wow64 = 0i32;

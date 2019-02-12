@@ -8,10 +8,11 @@ pub struct Handle(HANDLE);
 
 impl Handle {
     /// Wrap up a HANDLE
-    pub fn new(handle: HANDLE) -> Handle {
-        assert!(handle != std::ptr::null_mut(),
-            "NULL pointer passed to Handle::new()");
-        Handle(handle)
+    pub fn new(handle: HANDLE) -> Option<Handle> {
+        // Return None if the handle is null
+        if handle == std::ptr::null_mut() { return None; }
+
+        Some(Handle(handle))
     }
 
     /// Gets the raw HANDLE value this `Handle` represents

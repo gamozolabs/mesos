@@ -21,7 +21,8 @@ pub fn sedebug() {
             TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut token) != 0);
         
         // Wrap up the handle so it'll get Dropped correctly
-        let token = Handle::new(token);
+        let token = Handle::new(token)
+            .expect("Failed to get valid handle for token");
 
         // Lookup SeDebugPrivilege
         let privname = win32_string("SeDebugPrivilege");
