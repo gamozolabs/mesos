@@ -69,6 +69,27 @@ target is 64-bit: true
 [      0.732045] Applied      28569 breakpoints (   1613879 total breakpoints) iertutil.dll
 ```
 
+# Performance
+
+- We can register (request breakpoints to be at module load) about ~6 million/second
+- We can apply them (actually install the breakpoints into the target at about ~3 million/second
+- We can clear breakpoints at about 15 million/second
+- We can hit and handle about 10k breakpoints/second
+
+Given breakpoints are cleared as they're hit for coverage, that means you can observe 10k _new_ blocks per second. Once you've hit a breakpoint they no longer have a performance cost!
+
+```
+C:\dev\mesos\examples\benchmark>cargo run --release
+    Finished release [optimized + debuginfo] target(s) in 0.03s
+     Running `target\release\benchmark.exe`
+mesos  is 64-bit: true
+target is 64-bit: true
+Registered    1000000 breakpoints in   0.162230 seconds |  6164072.8 / second
+Applied       1000000 breakpoints in   0.321347 seconds |  3111897.0 / second
+Cleared       1000000 breakpoints in   0.067024 seconds | 14920028.6 / second
+Hit            100000 breakpoints in  10.066440 seconds |     9934.0 / second
+```
+
 # Usage
 
 To use mesos there are 3 major steps. First, the modules of a running process are saved. Second, these modules are loaded in IDA which then outputs a list of all basic blocks into the `meso` format. And finally, `mesos` is run against a target process to gather coverage!
