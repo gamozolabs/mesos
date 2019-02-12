@@ -28,6 +28,7 @@ use winapi::um::processthreadsapi::GetCurrentProcess;
 use winapi::um::processthreadsapi::SetThreadContext;
 use winapi::um::processthreadsapi::GetThreadContext;
 use winapi::um::processthreadsapi::FlushInstructionCache;
+use winapi::um::processthreadsapi::TerminateProcess;
 use winapi::um::processthreadsapi::OpenProcess;
 use winapi::um::wow64apiset::IsWow64Process;
 use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
@@ -35,7 +36,7 @@ use winapi::um::psapi::GetMappedFileNameW;
 use winapi::um::winnt::HANDLE;
 
 use std::time::{Duration, Instant};
-use std::collections::{HashSet, HashMap};
+use std::collections::{HashSet, HashMap};                                                                                                           
 use std::path::Path;
 use std::sync::Arc;
 use std::fs::File;
@@ -44,11 +45,21 @@ use std::io::BufWriter;
 use std::sync::atomic::{AtomicBool, Ordering};
 use winapi::um::consoleapi::SetConsoleCtrlHandler;
 
-use minidump::dump;
-use handles::Handle;
+use crate::minidump::dump;
+use crate::handles::Handle;
 
 /// Tracks if an exit has been requested via the Ctrl+C/Ctrl+Break handler
 static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Function invoked on module loads
+/// (debugger, module filename, module base)
+type ModloadFunc = fn(&mut Debugger, &str, usize);
+
+/// Function invoked on breakpoints
+/// (debugger, tid, address of breakpoint,
+///  number of times breakpoint has been hit)
+/// If this returns false the debuggee is terminated
+type BreakpointCallback = fn(&mut Debugger, u32, usize, u64) -> bool;
 
 /// Ctrl+C handler so we can remove breakpoints and detach from the debugger
 unsafe extern "system" fn ctrl_c_handler(_ctrl_type: u32) -> i32 {
@@ -63,7 +74,7 @@ unsafe extern "system" fn ctrl_c_handler(_ctrl_type: u32) -> i32 {
 
 /// Different types of breakpoints
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum BreakpointType {
+pub enum BreakpointType {
     /// Keep the breakpoint in place and keep track of how many times it was
     /// hit
     Freq,
@@ -73,7 +84,7 @@ enum BreakpointType {
 }
 
 /// Structure to represent breakpoints
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Breakpoint {
     /// Offset from module base
     offset: usize,
@@ -96,6 +107,12 @@ pub struct Breakpoint {
 
     /// Module name
     modname: Arc<String>,
+
+    /// Callback to invoke if this breakpoint is hit
+    callback: Option<BreakpointCallback>,
+
+    /// Number of times this breakpoint has been hit
+    freq: u64,
 }
 
 /// Debugger for a single process
@@ -115,6 +132,9 @@ pub struct Debugger<'a> {
     /// Handle to the process, given by the first create process event so it
     /// is not present until `run()` is used
     process_handle: Option<HANDLE>,
+
+    /// List of callbacks to invoke when a module is loaded
+    module_load_callbacks: Option<Vec<ModloadFunc>>,
 
     /// Thread ID to handle map
     thread_handles: HashMap<u32, HANDLE>,
@@ -149,6 +169,9 @@ pub struct Debugger<'a> {
     /// Prints breakpoints as we hit them if set
     bp_print: bool,
 
+    /// Tracks if we want to kill the debuggee
+    kill_requested: bool,
+
     /// Pointer to aligned context structure
     context: &'a mut CONTEXT,
     _context_backing: Vec<u8>,
@@ -158,13 +181,6 @@ pub struct Debugger<'a> {
 fn elapsed_from(start: &Instant) -> f64 {
     let dur = start.elapsed();
     dur.as_secs() as f64 + dur.subsec_nanos() as f64 / 1_000_000_000.0
-}
-
-/// Grab a native-endianness u32 from a slice of u8s
-fn u32_from_slice(val: &[u8]) -> u32 {
-    let mut tmp = [0u8; 4];
-    tmp.copy_from_slice(&val[..4]);
-    u32::from_ne_bytes(tmp)
 }
 
 // Mesos print with uptime prefix
@@ -237,18 +253,20 @@ impl<'a> Debugger<'a> {
 
         // Construct the new Debugger object :)
         Debugger {
-            target_breakpoints: HashMap::new(),
-            breakpoints:        HashMap::new(),
-            process_handle:     None,
-            thread_handles:     HashMap::new(),
-            coverage:           HashMap::new(),
-            minmax_breakpoint:  HashMap::new(),
-            modules:            HashSet::new(),
-            single_step:        HashMap::new(),
-            always_freq:        false,
-            last_db_save:       Instant::now(),
-            verbose:            false,
-            bp_print:           false,
+            target_breakpoints:    HashMap::new(),
+            breakpoints:           HashMap::new(),
+            process_handle:        None,
+            thread_handles:        HashMap::new(),
+            coverage:              HashMap::new(),
+            minmax_breakpoint:     HashMap::new(),
+            modules:               HashSet::new(),
+            single_step:           HashMap::new(),
+            module_load_callbacks: Some(Vec::new()),
+            always_freq:           false,
+            kill_requested:        false,
+            last_db_save:          Instant::now(),
+            verbose:               false,
+            bp_print:              false,
             pid, start_time,
 
             context: unsafe { &mut *cptr },
@@ -256,8 +274,61 @@ impl<'a> Debugger<'a> {
         }
     }
 
+    /// Get a list of all thread IDs currently active on this process
+    pub fn get_thread_list(&self) -> Vec<u32> {
+        self.thread_handles.keys().cloned().collect()
+    }
+
+    /// Register a function to be invoked on module loads
+    pub fn register_modload_callback(&mut self, func: ModloadFunc) {
+        self.module_load_callbacks.as_mut()
+            .expect("Cannot add callback during callback").push(func);
+    }
+
+    /// Registers a breakpoint for a specific file
+    /// `module` is the name of the module we want to apply the breakpoint to,
+    /// for example "notepad.exe", `offset` is the byte offset in this module
+    /// to apply the breakpoint to
+    /// 
+    /// `name` and `nameoff` are completely user controlled and are used to
+    /// give this breakpoint a unique name. Often if used from mesos `name`
+    /// will correspond to the function name and `nameoff` will be the offset
+    /// into the function. However these can be whatever you like. It's only
+    /// for readability of the coverage data
+    pub fn register_breakpoint(&mut self, module: Arc<String>, offset: usize,
+            name: Arc<String>, nameoff: usize, typ: BreakpointType,
+            callback: Option<BreakpointCallback>) {
+        // Create a new entry if none exists
+        if !self.target_breakpoints.contains_key(&**module) {
+            self.target_breakpoints.insert(module.to_string(), Vec::new());
+        }
+
+        if !self.minmax_breakpoint.contains_key(&**module) {
+            self.minmax_breakpoint.insert(module.to_string(), (!0, 0));
+        }
+
+        let mmbp = self.minmax_breakpoint.get_mut(&**module).unwrap();
+        mmbp.0 = std::cmp::min(mmbp.0, offset as usize);
+        mmbp.1 = std::cmp::max(mmbp.1, offset as usize);
+
+        // Append this breakpoint
+        self.target_breakpoints.get_mut(&**module).unwrap().push(
+            Breakpoint {
+                offset:    offset as usize,
+                enabled:   false,
+                typ:       typ,
+                orig_byte: None,
+                funcname:  name.clone(),
+                funcoff:   nameoff,
+                modname:   module.clone(),
+                freq:      0,
+                callback,
+            }
+        );
+    }
+
     /// Gets a raw `HANDLE` to the process we are attached to
-    pub fn process_handle(&self) -> HANDLE {
+    fn process_handle(&self) -> HANDLE {
         self.process_handle.expect("No process handle present")
     }
 
@@ -265,138 +336,9 @@ impl<'a> Debugger<'a> {
     pub fn set_verbose(&mut self, val: bool)     { self.verbose     = val; }
     pub fn set_bp_print(&mut self, val: bool)    { self.bp_print    = val; }
 
-    /// Loads all breakpoints applicable to the mapped file at `base`
-    pub fn load_breakpoints(&mut self, base: usize) {
-        let path = self.compute_cached_meso_name(base);
-        self.load_meso_from_cache(path);
-    }
-
-    /// Load a meso from the cache based on `path`
-    pub fn load_meso_from_cache(&mut self, path: String) {
-        // Create the cache file name
-        let cache_path = Path::new(&path);
-
-        if !cache_path.is_file() {
-            if self.verbose {
-                mprint!(self, "No meso in cache for {}, ignoring\n", path);
-            }
-            return;
-        }
-
-        // Load the meso
-        self.load_meso(cache_path);
-    }
-
-    /// Load a meso file, declaring the breakpoints to apply
-    pub fn load_meso(&mut self, meso_path: &Path) {
-        // Read the file
-        let meso: Vec<u8> = std::fs::read(meso_path)
-            .expect("Failed to read meso");
-
-        let mut added_breakpoints = 0;
-
-        let start_time = Instant::now();
-
-        // Current module name we are processing
-        let mut cur_modname: Option<Arc<String>> = None;
-
-        let mut ptr = &meso[..];
-
-        macro_rules! read {
-            ($ty:ty) => {{
-                let mut array = [0; std::mem::size_of::<$ty>()];
-                array.copy_from_slice(&ptr[..std::mem::size_of::<$ty>()]);
-                ptr = &ptr[std::mem::size_of::<$ty>()..];
-                <$ty>::from_le_bytes(array)
-            }};
-        }
-
-        while ptr.len() > 0 {        
-            // Get record type
-            let record = read!(u8);
-
-            if record == 0 {
-                // Module record
-                let modname_len = read!(u16);
-
-                // Convert name to Rust str
-                let modname = std::str::from_utf8(&ptr[..modname_len as usize])
-                    .expect("Module name was not valid UTF-8");
-                ptr = &ptr[modname_len as usize..];
-
-                cur_modname = Some(Arc::new(modname.into()));
-            } else if record == 1 {
-                // Current module name state
-                let module: &Arc<String> = cur_modname.as_ref().unwrap();
-
-                // Function record
-                let funcname_len = read!(u16);
-
-                // Convert name to Rust str
-                let funcname: Arc<String> =
-                    Arc::new(std::str::from_utf8(&ptr[..funcname_len as usize])
-                        .expect("Function name was not valid UTF-8")
-                        .to_string());
-                ptr = &ptr[funcname_len as usize..];
-
-                // Get function offset from module base
-                let funcoff = read!(u64);
-
-                // Get number of basic blocks
-                let num_blocks = read!(u32) as usize;
-
-                // Iterate over all block offsets
-                for _ in 0..num_blocks {
-                    let blockoff = read!(i32) as i64 as u64;
-
-                    // Add function offset from module base to offset
-                    let offset = funcoff.wrapping_add(blockoff);
-
-                    // Create a new entry if none exist
-                    if !self.target_breakpoints.contains_key(&**module) {
-                        self.target_breakpoints.insert(module.to_string(), Vec::new());
-                    }
-
-                    if !self.minmax_breakpoint.contains_key(&**module) {
-                        self.minmax_breakpoint.insert(module.to_string(), (!0, 0));
-                    }
-
-                    let mmbp = self.minmax_breakpoint.get_mut(&**module).unwrap();
-                    mmbp.0 = std::cmp::min(mmbp.0, offset as usize);
-                    mmbp.1 = std::cmp::max(mmbp.1, offset as usize);
-
-                    // Append this breakpoint
-                    self.target_breakpoints.get_mut(&**module).unwrap().push(
-                        Breakpoint {
-                            offset:    offset as usize,
-                            enabled:   false,
-                            typ:       BreakpointType::Single,
-                            orig_byte: None,
-                            funcname:  funcname.clone(),
-                            funcoff:   blockoff as usize,
-                            modname:   module.clone(),
-                        }
-                    );
-
-                    added_breakpoints += 1;
-                }
-            } else {
-                panic!("Unhandled record");
-            }
-        }
-
-        if self.verbose {
-            let ef = elapsed_from(&start_time);
-            mprint!(self, "Loaded meso file {:?} in {:.6} seconds, requesting {} breakpoints when \
-                   module is loaded [{:.0} bps/sec]\n",
-                meso_path, ef, added_breakpoints,
-                added_breakpoints as f64 / ef);
-        }
-    }
-
     /// Resolves the file name of a given memory mapped file in the target
     /// process
-    pub fn filename_from_module_base(&self, base: usize) -> String {
+    fn filename_from_module_base(&self, base: usize) -> String {
         // Use GetMappedFileNameW() to get the mapped file name
         let mut buf = [0u16; 4096];
         let fnlen = unsafe {
@@ -414,33 +356,6 @@ impl<'a> Debugger<'a> {
         Path::new(&path).file_name().unwrap().to_str().unwrap().into()
     }
 
-    /// Computes the path to the cached meso filename for a given module loaded
-    /// at `base`
-    pub fn compute_cached_meso_name(&self, base: usize) -> String {
-        // Get base filename
-        let filename = self.filename_from_module_base(base);
-        
-        let mut image_header = [0u8; 4096];
-
-        // Read the image header at `base`
-        assert!(self.read_mem(base, &mut image_header) ==
-            std::mem::size_of_val(&image_header),
-            "Failed to read PE image header from target");
-
-        // Validate this is a PE
-        assert!(&image_header[0..2] == b"MZ", "File was not MZ");
-        let pe_ptr = u32_from_slice(&image_header[0x3c..0x40]) as usize;
-        assert!(&image_header[pe_ptr..pe_ptr+4] == b"PE\0\0");
-
-        // Get TimeDateStamp and ImageSize from the PE header
-        let timestamp = u32_from_slice(&image_header[pe_ptr+8..pe_ptr+0xc]);
-        let imagesz   =
-            u32_from_slice(&image_header[pe_ptr+0x50..pe_ptr+0x54]);
-
-        // Compute the meso name
-        format!("cache\\{}_{:x}_{:x}.meso", filename, timestamp, imagesz)
-    }
-
     /// Reads from `addr` in the process we're debugging into `buf`
     /// Returns number of bytes read
     pub fn read_mem(&self, addr: usize, buf: &mut [u8]) -> usize {
@@ -453,8 +368,7 @@ impl<'a> Debugger<'a> {
             unsafe {
                 // Issue a read
                 if ReadProcessMemory(
-                        self.process_handle(),
-                        (addr + offset) as *mut _,
+                        self.process_handle(), (addr + offset) as *mut _,
                         buf.as_mut_ptr().offset(offset as isize) as *mut _,
                         buf.len() - offset, &mut bread) == 0 {
                     // Return out on error
@@ -481,8 +395,7 @@ impl<'a> Debugger<'a> {
             unsafe {
                 // Issue a write
                 if WriteProcessMemory(
-                        self.process_handle(),
-                        (addr + offset) as *mut _,
+                        self.process_handle(), (addr + offset) as *mut _,
                         buf.as_ptr().offset(offset as isize) as *const _,
                         buf.len() - offset, &mut bread) == 0 {
                     // Return out on error
@@ -498,7 +411,7 @@ impl<'a> Debugger<'a> {
     }
 
     /// Flush all instruction caches in the target process
-    pub fn flush_instruction_caches(&self) {
+    fn flush_instruction_caches(&self) {
         unsafe {
             // Flush all instruction caches for the process
             assert!(FlushInstructionCache(
@@ -508,7 +421,7 @@ impl<'a> Debugger<'a> {
 
     /// Add the module loaded at `base` in the target process to our module
     /// list
-    pub fn register_module(&mut self, base: usize) {
+    fn register_module(&mut self, base: usize) {
         let filename = self.filename_from_module_base(base);
 
         // Insert into the module list
@@ -517,7 +430,7 @@ impl<'a> Debugger<'a> {
 
     /// Remove the module loaded at `base` in the target process from our
     /// module list
-    pub fn unregister_module(&mut self, base: usize) {
+    fn unregister_module(&mut self, base: usize) {
         let mut to_remove = None;
 
         // Find the corresponding module to this base
@@ -556,7 +469,7 @@ impl<'a> Debugger<'a> {
     /// Given a `base` of a module in the target process, identify the module
     /// and attempt to apply breakpoints to it if we have any scheduled for
     /// this module
-    pub fn apply_breakpoints(&mut self, base: usize) {
+    fn apply_breakpoints(&mut self, base: usize) {
         let filename = self.filename_from_module_base(base);
 
         // Bail if we don't have requested breakpoints for this module
@@ -580,7 +493,7 @@ impl<'a> Debugger<'a> {
 
         // Read all memory of this DLL that includes breakpoints
         // On partial reads that's fine, we'll only do a partial write later.
-        let _ = self.read_mem(base + minmax.0, &mut contents);
+        let bread = self.read_mem(base + minmax.0, &mut contents);
 
         // Attempt to apply all requested breakpoints
         for breakpoint in self.target_breakpoints.get(&filename).unwrap() {
@@ -607,7 +520,7 @@ impl<'a> Debugger<'a> {
         // Write in all the breakpoints
         // If it partially writes then that's fine, we just apply the
         // breakpoints we can
-        let _ = self.write_mem(base + minmax.0, &contents);
+        let _ = self.write_mem(base + minmax.0, &contents[..bread]);
         self.flush_instruction_caches();
 
         mprint!(self, "Applied {:10} breakpoints ({:10} total breakpoints) {}\n",
@@ -618,7 +531,7 @@ impl<'a> Debugger<'a> {
     }
 
     /// Remove all breakpoints, restoring the process to a clean state
-    pub fn remove_breakpoints(&mut self) {
+    fn remove_breakpoints(&mut self) {
         for (module, base) in self.modules.iter() {
             if !self.minmax_breakpoint.contains_key(module) {
                 // Ignore modules we have no applied breakpoints for
@@ -639,7 +552,7 @@ impl<'a> Debugger<'a> {
             // Read all memory of this DLL that includes breakpoints
             // On partial reads that's fine, we'll only do a partial write
             // later.
-            self.read_mem(base + minmax.0, &mut contents);
+            let bread = self.read_mem(base + minmax.0, &mut contents);
 
             let mut removed_bps = 0u64;
 
@@ -665,7 +578,7 @@ impl<'a> Debugger<'a> {
             // Remove all the breakpoints
             // On partial removes it's fine. If we can't write to the memory
             // it's not mapped in, so we can just ignore partial writes here.
-            let _ = self.write_mem(base + minmax.0, &contents);
+            let _ = self.write_mem(base + minmax.0, &contents[..bread]);
             self.flush_instruction_caches();
 
             mprint!(self, "Removed {} breakpoints in {}\n", removed_bps, module);
@@ -680,29 +593,33 @@ impl<'a> Debugger<'a> {
     }
 
     /// Handle a breakpoint
-    pub fn handle_breakpoint(&mut self, tid: u32, addr: usize) -> bool {
+    fn handle_breakpoint(&mut self, tid: u32, addr: usize) -> bool {
         if let Some(ref mut bp) = self.breakpoints.get_mut(&addr).cloned() {
             // If we apply a breakpoint over an actual breakpoint just exit
-            // out now
+            // out now because we don't want to handle it
             if bp.orig_byte == Some(0xcc) {
                 return true;
             }
-            
-            // Sometimes this can race so we just don't assert this anymore
-            //assert!(bp.enabled);
+
+            // Update breakpoint hit frequency
+            self.breakpoints.get_mut(&addr).unwrap().freq += 1;
 
             let mut orig_byte = [0u8; 1];
             orig_byte[0] = bp.orig_byte.unwrap();
 
+            // Restore original byte
             assert!(self.write_mem(addr, &orig_byte) == 1);
             self.flush_instruction_caches();
 
-            let funcoff = format!("{}+0x{:x}", bp.funcname, bp.funcoff);
-
+            // Create a new coverage record if one does not exist
             if !self.coverage.contains_key(&addr) {
+                let funcoff = format!("{}+0x{:x}", bp.funcname, bp.funcoff);
+
                 self.coverage.insert(addr,
                     (bp.modname.clone(), bp.offset, funcoff.clone(), 0));
             }
+
+            // Update coverage frequencies
             let freq = {
                 let bin = self.coverage.get_mut(&addr).unwrap();
                 bin.3 += 1;
@@ -711,6 +628,7 @@ impl<'a> Debugger<'a> {
 
             // Print coverage as we get it
             if self.bp_print {
+                let funcoff = format!("{}+0x{:x}", bp.funcname, bp.funcoff);
                 mprint!(self, "{:8} of {:8} hit | {:10} freq | 0x{:x} | \
                         {:>20}+0x{:08x} | {}\n",
                     self.coverage.len(), self.breakpoints.len(),
@@ -735,10 +653,17 @@ impl<'a> Debugger<'a> {
                 self.single_step.insert(tid, addr);
             } else {
                 // Breakpoint no longer enabled
-                bp.enabled = false;
+                self.breakpoints.get_mut(&addr).unwrap().enabled = false;
             }
 
             self.set_context(tid);
+
+            // Call the breakpoint callback if needed
+            if let Some(callback) = bp.callback {
+                if callback(self, tid, addr, bp.freq) == false {
+                    self.kill_requested = true;
+                }
+            }
         } else {
             // Hit unexpected breakpoint
             return false;
@@ -747,7 +672,12 @@ impl<'a> Debugger<'a> {
         true
     }
 
-    /// Get a thread context
+    /// Gets a mutable reference to the internal context structure
+    pub fn context(&mut self) -> &mut CONTEXT {
+        &mut self.context
+    }
+
+    /// Loads `tid`'s context into the internal context structure
     pub fn get_context(&mut self, tid: u32) {
         unsafe {
             assert!(GetThreadContext(
@@ -755,7 +685,7 @@ impl<'a> Debugger<'a> {
         }
     }
 
-    /// Set a thread context
+    /// Sets `tid`'s context from the internal context structure
     pub fn set_context(&mut self, tid: u32) {
         unsafe {
             assert!(SetThreadContext(
@@ -764,7 +694,7 @@ impl<'a> Debugger<'a> {
     }
 
     /// Get a filename to describe a given crash
-    pub fn get_crash_filename(&self, context: &CONTEXT,
+    fn get_crash_filename(&self, context: &CONTEXT,
                               exception: &EXCEPTION_RECORD) -> String {
         let pc = {
             #[cfg(target_pointer_width = "64")]
@@ -840,7 +770,7 @@ impl<'a> Debugger<'a> {
     }
 
     /// Sync the coverage database to disk
-    pub fn flush_coverage_database(&mut self) {
+    fn flush_coverage_database(&mut self) {
         mprint!(self, "Syncing code coverage database...\n");
 
         let mut fd = BufWriter::with_capacity(
@@ -872,6 +802,13 @@ impl<'a> Debugger<'a> {
                     Duration::from_secs(5) {
                 self.flush_coverage_database();
                 self.last_db_save = Instant::now();
+            }
+
+            if self.kill_requested {
+                assert!(
+                    TerminateProcess(self.process_handle.unwrap(), 123456) != 0,
+                    "Failed to kill target process");
+                self.kill_requested = false;
             }
         
             // Check if it's requested that we exit
@@ -918,17 +855,23 @@ impl<'a> Debugger<'a> {
                     self.process_handle = Some(create_process.hProcess);
                     self.thread_handles.insert(tid, create_process.hThread);
 
-                    // Register this module in our module list
-                    self.register_module(create_process.lpBaseOfImage as usize);
+                    let base = create_process.lpBaseOfImage as usize;
 
-                    // Attempt to load a meso file with breakpoints for this
-                    // module
-                    self.load_breakpoints(
-                        create_process.lpBaseOfImage as usize);
+                    // Register this module in our module list
+                    self.register_module(base);
+
+                    let mlcs = self.module_load_callbacks.take()
+                        .expect("Event without callbacks present");
+
+                    // Invoke callbacks
+                    for mlc in mlcs.iter() {
+                        mlc(self, &self.filename_from_module_base(base), base);
+                    }
+
+                    self.module_load_callbacks = Some(mlcs);
 
                     // Apply any pending breakpoints!
-                    self.apply_breakpoints(
-                        create_process.lpBaseOfImage as usize);
+                    self.apply_breakpoints(base);
                 }
                 CREATE_THREAD_DEBUG_EVENT => {
                     // A thread was created in the target
@@ -1037,11 +980,23 @@ impl<'a> Debugger<'a> {
                     // Wrap up the handle so it gets dropped
                     let _ = Handle::new(load_dll.hFile);
 
+                    let base = load_dll.lpBaseOfDll as usize;
+
                     // Register the module, attempt to load mesos, and apply
                     // all pending breakpoints
-                    self.register_module(load_dll.lpBaseOfDll as usize);
-                    self.load_breakpoints(load_dll.lpBaseOfDll as usize);
-                    self.apply_breakpoints(load_dll.lpBaseOfDll as usize);
+                    self.register_module(base);
+                    
+                    let mlcs = self.module_load_callbacks.take()
+                        .expect("Event without callbacks present");
+
+                    // Invoke callbacks
+                    for mlc in mlcs.iter() {
+                        mlc(self, &self.filename_from_module_base(base), base);
+                    }
+
+                    self.module_load_callbacks = Some(mlcs);
+
+                    self.apply_breakpoints(base);
                 }
                 EXIT_THREAD_DEBUG_EVENT => {
                     // Remove the thread handle for this thread

@@ -1,0 +1,8 @@
+[package]
+name = "debugger"
+version = "0.1.0"
+authors = ["Brandon Falk <bfalk@gamozolabs.com>"]
+edition = "2018"
+
+[dependencies]
+winapi = { version = "0.3.5", features = ["debugapi", "winbase", "memoryapi", "processthreadsapi", "errhandlingapi", "handleapi", "securitybaseapi", "consoleapi", "winerror", "wow64apiset", "psapi"] }

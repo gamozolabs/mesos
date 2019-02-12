@@ -16,6 +16,7 @@ use crate::handles::Handle;
 use crate::ffi_helpers::win32_string;
 
 #[repr(C)]
+#[allow(dead_code)]
 pub enum MinidumpType {
     MiniDumpNormal                         = 0x00000000,
     MiniDumpWithDataSegs                   = 0x00000001,
