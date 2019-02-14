@@ -1,5 +1,18 @@
 import collections, re, math
 
+def addr2block(addr):
+    f = idaapi.get_func(addr)
+    if not f:
+        print "No function at 0x%x" % (addr)
+        return None
+
+    fc = idaapi.FlowChart(f)
+
+    for block in fc:
+        if (block.startEA <= addr) and (block.endEA > addr):
+            return (block.startEA, block.endEA)
+    return None
+
 fft = re.compile("[0-9a-f]{16} \| Freq: +([0-9]+) \| +(.*?)\+0x([0-9a-f]+) \| (.*?)\n")
 
 image_base  = idaapi.get_imagebase()
@@ -49,6 +62,16 @@ for addr, freq in freqs.most_common()[::-1]:
     color = 0x808080 + (int((1 - dist) * 100.0) << 8) + (int(dist * 100.0) << 0)
     print("%10d | 0x%.16x | %s" % (freq, addr, get_func_off_str(addr)))
 
-    set_color(addr, CIC_ITEM, color)
-    set_cmt(addr, "Freq: %d | Func entry: %.2f" % (freq, float(freq) / float(func_entry_freq)), False)
+    blockbounds = addr2block(addr)
+    if blockbounds == None:
+        # Color just the single PC, we don't know what block it belongs to
+        set_color(addr, CIC_ITEM, color)
+    else:
+        # Color in the entire block
+        (ea, block_end) = blockbounds
+        while ea < block_end:
+            set_color(ea, CIC_ITEM, color)
+            ea = idc.NextHead(ea)
 
+    set_cmt(addr, "Freq: %d | Func entry: %.2f" % \
+        (freq, float(freq) / float(func_entry_freq)), False)
