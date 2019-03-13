@@ -38,7 +38,7 @@ fn main() {
 
     // Register callback routine for module loads so we can attempt to apply
     // breakpoints to it from the meso file cache
-    dbg.register_modload_callback(modload_handler);
+    dbg.register_modload_callback(Box::new(modload_handler));
 
     // Process arguments
     if args.len() > 2 {

@@ -34,6 +34,7 @@ use winapi::um::wow64apiset::IsWow64Process;
 use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
 use winapi::um::psapi::GetMappedFileNameW;
 use winapi::um::winnt::HANDLE;
+use winapi::um::minwinbase::DEBUG_EVENT;
 
 use std::time::{Duration, Instant};
 use std::collections::{HashSet, HashMap};                                                                                                           
@@ -53,7 +54,9 @@ static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Function invoked on module loads
 /// (debugger, module filename, module base)
-type ModloadFunc = fn(&mut Debugger, &str, usize);
+type ModloadFunc = Box<Fn(&mut Debugger, &str, usize)>;
+
+type DebugEventFunc = Box<Fn(&mut Debugger, &DEBUG_EVENT)>;
 
 /// Function invoked on breakpoints
 /// (debugger, tid, address of breakpoint,
@@ -135,6 +138,8 @@ pub struct Debugger<'a> {
 
     /// List of callbacks to invoke when a module is loaded
     module_load_callbacks: Option<Vec<ModloadFunc>>,
+
+    debug_event_callbacks: Option<Vec<DebugEventFunc>>,
 
     /// Thread ID to handle map
     thread_handles: HashMap<u32, HANDLE>,
@@ -262,6 +267,7 @@ impl<'a> Debugger<'a> {
             modules:               HashSet::new(),
             single_step:           HashMap::new(),
             module_load_callbacks: Some(Vec::new()),
+            debug_event_callbacks: Some(Vec::new()),
             always_freq:           false,
             kill_requested:        false,
             last_db_save:          Instant::now(),
@@ -282,6 +288,11 @@ impl<'a> Debugger<'a> {
     /// Register a function to be invoked on module loads
     pub fn register_modload_callback(&mut self, func: ModloadFunc) {
         self.module_load_callbacks.as_mut()
+            .expect("Cannot add callback during callback").push(func);
+    }
+
+    pub fn register_debug_event_callback(&mut self, func: DebugEventFunc) {
+        self.debug_event_callbacks.as_mut()
             .expect("Cannot add callback during callback").push(func);
     }
 
@@ -828,6 +839,14 @@ impl<'a> Debugger<'a> {
                 panic!("WaitForDebugEvent() returned error : {}",
                     GetLastError());
             }
+
+            let decs = self.debug_event_callbacks.take()
+                .expect("Event without callbacks present");
+            // Invoke callbacks
+            for de in decs.iter() {
+                de(self, &event);
+            }
+            self.debug_event_callbacks = Some(decs);
 
             // Get the PID and TID for the event
             let pid = event.dwProcessId;
