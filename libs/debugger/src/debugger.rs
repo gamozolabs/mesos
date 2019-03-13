@@ -56,6 +56,7 @@ static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// (debugger, module filename, module base)
 type ModloadFunc = Box<Fn(&mut Debugger, &str, usize)>;
 
+/// Function invoked on debug events
 type DebugEventFunc = Box<Fn(&mut Debugger, &DEBUG_EVENT)>;
 
 /// Function invoked on breakpoints
@@ -139,6 +140,7 @@ pub struct Debugger<'a> {
     /// List of callbacks to invoke when a module is loaded
     module_load_callbacks: Option<Vec<ModloadFunc>>,
 
+    /// List of callbacks to invoke when a debug event is fired
     debug_event_callbacks: Option<Vec<DebugEventFunc>>,
 
     /// Thread ID to handle map
@@ -291,6 +293,7 @@ impl<'a> Debugger<'a> {
             .expect("Cannot add callback during callback").push(func);
     }
 
+    /// Register a function to be invoked on debug events
     pub fn register_debug_event_callback(&mut self, func: DebugEventFunc) {
         self.debug_event_callbacks.as_mut()
             .expect("Cannot add callback during callback").push(func);
