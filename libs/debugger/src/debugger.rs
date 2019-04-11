@@ -24,27 +24,33 @@ use winapi::um::debugapi::DebugActiveProcessStop;
 use winapi::um::debugapi::DebugActiveProcess;
 use winapi::um::debugapi::ContinueDebugEvent;
 use winapi::um::winbase::InitializeContext;
+use winapi::um::processthreadsapi::GetProcessId;
 use winapi::um::processthreadsapi::GetCurrentProcess;
 use winapi::um::processthreadsapi::SetThreadContext;
 use winapi::um::processthreadsapi::GetThreadContext;
 use winapi::um::processthreadsapi::FlushInstructionCache;
 use winapi::um::processthreadsapi::TerminateProcess;
 use winapi::um::processthreadsapi::OpenProcess;
+use winapi::um::processthreadsapi::CreateProcessA;
 use winapi::um::wow64apiset::IsWow64Process;
 use winapi::um::winnt::PROCESS_QUERY_LIMITED_INFORMATION;
 use winapi::um::psapi::GetMappedFileNameW;
 use winapi::um::winnt::HANDLE;
 use winapi::um::minwinbase::DEBUG_EVENT;
+use winapi::um::winbase::DEBUG_PROCESS;
+use winapi::um::winbase::DEBUG_ONLY_THIS_PROCESS;
 
 use std::time::{Duration, Instant};
 use std::collections::{HashSet, HashMap};                                                                                                           
 use std::path::Path;
 use std::sync::Arc;
 use std::fs::File;
+use std::ffi::CString;
 use std::io::Write;
 use std::io::BufWriter;
 use std::sync::atomic::{AtomicBool, Ordering};
 use winapi::um::consoleapi::SetConsoleCtrlHandler;
+
 
 use crate::minidump::dump;
 use crate::handles::Handle;
@@ -201,6 +207,47 @@ macro_rules! mprint {
 impl<'a> Debugger<'a> {
     /// Create a new debugger and attach to `pid`
     pub fn attach(pid: u32) -> Debugger<'a> {
+        Debugger::attach_internal(pid, false)
+    }
+
+    /// Create a new process argv[0], with arguments argv[1..] and attach to it
+    pub fn spawn_proc(argv: &[String], follow_fork: bool) -> Debugger<'a> {
+        let mut startup_info = unsafe { std::mem::zeroed() };
+        let mut proc_info = unsafe { std::mem::zeroed() };
+
+        let cmdline = CString::new(argv.join(" ")).unwrap();
+
+        let cmdline_ptr = cmdline.into_raw();
+
+        let flags = if follow_fork {
+            DEBUG_PROCESS 
+        }
+        else {
+            DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS
+        };
+
+        unsafe {
+            assert!(CreateProcessA(
+                std::ptr::null_mut(), // lpApplicationName
+                cmdline_ptr, // lpCommandLine
+                std::ptr::null_mut(), // lpProcessAttributes
+                std::ptr::null_mut(), // lpThreadAttributes
+                0, // bInheritHandles
+                flags, // dwCreationFlags
+                std::ptr::null_mut(), // lpEnvironment
+                std::ptr::null_mut(), // lpCurrentDirectory
+                &mut startup_info, // lpStartupInfo
+                &mut proc_info) != 0,  // lpProcessInformation
+                "Failed to create process.");
+        }
+
+        let pid = unsafe { GetProcessId(proc_info.hProcess) };
+        
+        Debugger::attach_internal(pid, true)
+    }
+
+    /// Create a new debugger
+    pub fn attach_internal(pid: u32, attached: bool) -> Debugger<'a> {
         // Save the start time
         let start_time = Instant::now();
 
@@ -238,10 +285,12 @@ impl<'a> Debugger<'a> {
             assert!(cur_is_wow64 == target_is_wow64,
                 "Target process does not match mesos bitness");
             
-            // Attach to the target!
-            assert!(DebugActiveProcess(pid) != 0,
-                "Failed to attach to process, is your PID valid \
-                 and do you have correct permissions?");
+            if !attached {
+                // Attach to the target!
+                assert!(DebugActiveProcess(pid) != 0,
+                        "Failed to attach to process, is your PID valid \
+                        and do you have correct permissions?");
+             }
         }
 
         // Correctly initialize a context so it's aligned. We overcommit
