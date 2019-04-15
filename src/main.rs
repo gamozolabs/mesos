@@ -39,7 +39,7 @@ fn main() {
     }
 
 
-    let mut pid: i32 = -1;
+    let mut pid: Option<u32> = None;
     let mut frequency_mode_enabled = false;
     let mut verbose_mode_enabled = false;
     let mut follow_fork_enabled = false;
@@ -51,7 +51,7 @@ fn main() {
     if args.len() > 2 {
         for (i, arg) in args[1..].iter().enumerate() {
             if arg == "-p" {
-                pid = arg.parse().unwrap();
+                pid = Some(arg.parse().unwrap());
             }
             else if arg == "--verbose" {
                 verbose_mode_enabled = true;
@@ -77,11 +77,11 @@ fn main() {
     }
 
     let mut dbg:Debugger;
-    if pid == -1 && argv.len() > 0 {
+    if pid.is_none() && argv.len() > 0 {
         dbg = Debugger::spawn_proc(&argv, follow_fork_enabled);
     }
     else {
-        dbg = Debugger::attach(args[1].parse().unwrap());
+        dbg = Debugger::attach(pid.unwrap() as u32);
     }
 
     // Attach to process
