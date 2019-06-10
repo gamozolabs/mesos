@@ -154,8 +154,8 @@ pub struct Debugger<'a> {
 
     /// List of all PCs we hit during execution
     /// Keyed by PC
-    /// Tuple is (module, offset, symbol+offset, frequency)
-    coverage: HashMap<usize, (Arc<String>, usize, String, u64)>,
+    /// Tuple is (module, offset, symbol+offset, frequency, threadid)
+    coverage: HashMap<usize, (Arc<String>, usize, String, u64, u32)>,
 
     /// Set of DLL names and the corresponding DLL base
     modules: HashSet<(String, usize)>,
@@ -679,7 +679,7 @@ impl<'a> Debugger<'a> {
                 let funcoff = format!("{}+0x{:x}", bp.funcname, bp.funcoff);
 
                 self.coverage.insert(addr,
-                    (bp.modname.clone(), bp.offset, funcoff.clone(), 0));
+                    (bp.modname.clone(), bp.offset, funcoff.clone(), 0, tid));
             }
 
             // Update coverage frequencies
@@ -693,10 +693,10 @@ impl<'a> Debugger<'a> {
             if self.bp_print {
                 let funcoff = format!("{}+0x{:x}", bp.funcname, bp.funcoff);
                 mprint!(self, "{:8} of {:8} hit | {:10} freq | 0x{:x} | \
-                        {:>20}+0x{:08x} | {}\n",
+                        {:>20}+0x{:08x} | {} | {}\n",
                     self.coverage.len(), self.breakpoints.len(),
                     freq,
-                    addr, bp.modname, bp.offset, funcoff);
+                    addr, bp.modname, bp.offset, funcoff, tid);
             }
 
             self.get_context(tid);
@@ -841,11 +841,11 @@ impl<'a> Debugger<'a> {
             File::create("coverage.txt")
                 .expect("Failed to open freq coverage file"));
 
-        for (pc, (module, offset, symoff, freq)) in self.coverage.iter() {
+        for (pc, (module, offset, symoff, freq, tid)) in self.coverage.iter() {
             write!(fd,
                    "{:016x} | Freq: {:10} | \
-                   {:>20}+0x{:08x} | {}\n",
-                   pc, freq, module, offset, symoff)
+                   {:>20}+0x{:08x} | {} | {}\n",
+                   pc, freq, module, offset, symoff, tid)
                 .expect("Failed to write coverage info");
         }
 
@@ -989,7 +989,7 @@ impl<'a> Debugger<'a> {
                             let filename = self.get_crash_filename(
                                 &self.context, &mut exception.ExceptionRecord);
 
-                            mprint!(self, "Got crash: {}\n", filename);
+                            mprint!(self, "Got crash (ThreadID: {}): {}\n", tid, filename);
 
                             if !Path::new(&filename).is_file() {
                                 // Remove all breakpoints in the program

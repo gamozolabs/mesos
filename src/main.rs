@@ -51,7 +51,7 @@ fn main() {
     if args.len() > 2 {
         for (i, arg) in args[1..].iter().enumerate() {
             if arg == "-p" {
-                pid = Some(arg.parse().unwrap());
+                pid = Some(args[i+2].parse().unwrap());
             }
             else if arg == "--verbose" {
                 verbose_mode_enabled = true;
