@@ -60,10 +60,10 @@ static EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Function invoked on module loads
 /// (debugger, module filename, module base)
-type ModloadFunc = Box<Fn(&mut Debugger, &str, usize)>;
+type ModloadFunc = Box<dyn Fn(&mut Debugger, &str, usize)>;
 
 /// Function invoked on debug events
-type DebugEventFunc = Box<Fn(&mut Debugger, &DEBUG_EVENT)>;
+type DebugEventFunc = Box<dyn Fn(&mut Debugger, &DEBUG_EVENT)>;
 
 /// Function invoked on breakpoints
 /// (debugger, tid, address of breakpoint,

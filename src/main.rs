@@ -49,9 +49,10 @@ fn main() {
     let mut argv: Vec<String> = Vec::new();
 
     if args.len() > 2 {
-        for (i, arg) in args[1..].iter().enumerate() {
+        for (ii, arg) in args[1..].iter().enumerate() {
             if arg == "-p" {
-                pid = Some(arg.parse().unwrap());
+                pid = Some(args.get(ii + 2)
+                .expect("No PID specified with -p argument").parse().unwrap());
             }
             else if arg == "--verbose" {
                 verbose_mode_enabled = true;
@@ -66,7 +67,7 @@ fn main() {
                 follow_fork_enabled = true;
             }
             else if arg == "--" {
-                argv.extend_from_slice(&args[i + 2..]);
+                argv.extend_from_slice(&args[ii + 2..]);
                 break;
             }
             else { // Has to be a mesofile
