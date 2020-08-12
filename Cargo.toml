@@ -2,6 +2,7 @@
 name = "mesos"
 version = "0.1.0"
 authors = ["bfalk"]
+license = "MIT"
 
 [dependencies]
 debugger = { path = "libs/debugger" }
